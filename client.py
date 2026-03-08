@@ -8,7 +8,11 @@ Usage:
   python client.py task claim <agent> [task_id]
   python client.py task done <agent> <task_id> "<result>"
   python client.py task fail <agent> <task_id> "<reason>"
-  python client.py watch [agent] [--interval N]   # live feed of new messages/tasks
+  python client.py orchestrate "<goal>"              # Level 5: autonomous goal execution
+  python client.py plans                             # list orchestration plans
+  python client.py plan <plan_id>                    # get plan details
+  python client.py runners                           # show runner availability
+  python client.py watch [agent] [--interval N]      # live feed of new messages/tasks
   python client.py listen <channel>
   python client.py inbox <agent>
   python client.py history [channel] [--limit N]
@@ -275,6 +279,71 @@ def cmd_status(server: str):
     print(f"  Dashboard:        {server}/ui")
 
 
+def cmd_orchestrate(server: str, args):
+    if not args:
+        print("Usage: python client.py orchestrate \"<goal>\"", file=sys.stderr)
+        sys.exit(1)
+    goal = " ".join(args)
+    result = api(server, "POST", "/orchestrate", json={"goal": goal, "background": True})
+    print(f"🎯 Orchestration started!")
+    print(f"   Goal: {goal}")
+    print(f"   {result.get('message', '')}")
+    print(f"\n   Monitor: {server}/orchestrate/plans")
+    print(f"   Dashboard: {server}/ui")
+    print(f"\n   Tip: python client.py plans   (check progress)")
+    print(f"        python client.py watch      (live feed)")
+
+
+def cmd_plans(server: str, args):
+    plans = api(server, "GET", "/orchestrate/plans")
+    if not plans:
+        print("No orchestration plans yet.")
+        return
+    print(f"{len(plans)} plan(s):")
+    for p in plans:
+        icon = {"planning": "🔍", "running": "⚙️ ", "done": "✅", "failed": "❌"}.get(p["status"], "•")
+        steps = p.get("steps", {})
+        step_str = " | ".join(f"{k}: {v}" for k, v in steps.items()) if steps else ""
+        print(f"\n  {icon} [{p['plan_id']}] {p['goal']}")
+        print(f"     Status: {p['status']}  Steps: {step_str}")
+
+
+def cmd_plan(server: str, args):
+    if not args:
+        print("Usage: python client.py plan <plan_id>", file=sys.stderr)
+        sys.exit(1)
+    plan = api(server, "GET", f"/orchestrate/plans/{args[0]}")
+    icon = {"planning": "🔍", "running": "⚙️ ", "done": "✅", "failed": "❌"}.get(plan["status"], "•")
+    print(f"{icon} Plan [{plan['id']}] — {plan['status'].upper()}")
+    print(f"  Goal: {plan['goal']}")
+    print(f"\n  Steps ({len(plan['steps'])}):")
+    for s in plan["steps"]:
+        step_icon = {"pending": "⏳", "running": "⚙️ ", "done": "✅", "failed": "❌", "skipped": "⏭️ "}.get(s["status"], "•")
+        deps = f" (needs: {', '.join(s['depends_on'])})" if s["depends_on"] else ""
+        print(f"    {step_icon} [{s['id']}] {s['title']} → {s['assigned_to']}{deps}")
+        if s.get("result"):
+            preview = s["result"][:120].replace("\n", " ")
+            print(f"         Result: {preview}{'...' if len(s['result']) > 120 else ''}")
+
+
+def cmd_runners(server: str):
+    status = api(server, "GET", "/runners/status")
+    if "error" in status:
+        print(f"⚠️  Runners not available: {status['error']}")
+        return
+    print("Agent Runner Status:")
+    icons = {True: "✅", False: "❌"}
+    print(f"  {icons[status.get('copilot_api', False)]} Copilot API  (GITHUB_TOKEN)")
+    print(f"  {icons[status.get('gemini_api', False)]} Gemini API   (GEMINI_API_KEY)")
+    print(f"  {icons[status.get('copilot_cli', False)]} Copilot CLI  (copilot on PATH)")
+    print(f"  {icons[status.get('gemini_cli', False)]} Gemini CLI   (gemini on PATH)")
+    print(f"  Preferred mode: {status.get('preferred_mode', 'api')}")
+    if not any([status.get('copilot_api'), status.get('gemini_api'),
+                status.get('copilot_cli'), status.get('gemini_cli')]):
+        print("\n  ⚠️  No runners available! Set GITHUB_TOKEN or GEMINI_API_KEY")
+        print("     Or start daemon manually: python -m runners.daemon --agent copilot")
+
+
 def cmd_watch(server: str, args):
     """Poll for new messages and tasks, printing them as they arrive."""
     agent = args[0] if args else None
@@ -410,6 +479,14 @@ def main():
         cmd_history(server, rest, limit=limit)
     elif cmd == "status":
         cmd_status(server)
+    elif cmd == "orchestrate":
+        cmd_orchestrate(server, rest)
+    elif cmd == "plans":
+        cmd_plans(server, rest)
+    elif cmd == "plan":
+        cmd_plan(server, rest)
+    elif cmd == "runners":
+        cmd_runners(server)
     elif cmd == "watch":
         cmd_watch(server, rest)
     elif cmd == "reset":

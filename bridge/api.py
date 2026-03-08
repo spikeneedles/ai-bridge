@@ -216,18 +216,80 @@ async def complete_task(task_id: str, body: CompleteBody):
     return task
 
 
-@app.post("/tasks/{task_id}/fail", response_model=Task)
-async def fail_task(task_id: str, body: FailBody):
-    try:
-        task = await queue.fail(task_id=task_id, agent=body.agent, reason=body.reason)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    await manager.broadcast_task_update(task.model_dump())
-    sys_msg = Message(
-        channel="system",
-        sender="system",
-        content=f"Task [{task.id}] \"{task.title}\" failed: {body.reason}",
-    )
     await save_message(sys_msg)
     await manager.broadcast(sys_msg)
     return task
+
+
+# ─── Orchestrator endpoints ───────────────────────────────────────────────────
+
+class OrchestrationRequest(BaseModel):
+    goal: str
+    context: str = ""
+    background: bool = True
+
+
+_active_plans: dict = {}
+
+
+@app.post("/orchestrate")
+async def start_orchestration(req: OrchestrationRequest):
+    """Submit a high-level goal. The orchestrator decomposes and autonomously drives agents."""
+    import asyncio
+    try:
+        from orchestrator import supervisor
+    except ImportError as e:
+        raise HTTPException(status_code=503, detail=f"Orchestrator not available: {e}")
+
+    if req.background:
+        async def _run():
+            plan = await supervisor.run_goal(req.goal, req.context)
+            _active_plans[plan.id] = plan
+        asyncio.create_task(_run())
+        return {"status": "started", "message": "Running in background. Monitor at /orchestrate/plans"}
+    else:
+        plan = await supervisor.run_goal(req.goal, req.context)
+        _active_plans[plan.id] = plan
+        return plan.__dict__
+
+
+@app.get("/orchestrate/plans")
+async def list_plans():
+    """List all orchestration plans and their status."""
+    try:
+        from orchestrator import supervisor
+        return supervisor.all_plans()
+    except ImportError:
+        return []
+
+
+@app.get("/orchestrate/plans/{plan_id}")
+async def get_plan(plan_id: str):
+    """Get detailed status of a plan including all steps."""
+    try:
+        from orchestrator import supervisor
+        plan = supervisor.get_plan(plan_id)
+        if not plan:
+            raise HTTPException(status_code=404, detail="Plan not found")
+        return {
+            "id": plan.id, "goal": plan.goal, "status": plan.status,
+            "created_at": plan.created_at, "completed_at": plan.completed_at,
+            "steps": [
+                {"id": s.id, "title": s.title, "assigned_to": s.assigned_to,
+                 "status": s.status, "depends_on": s.depends_on,
+                 "result": s.result, "retries": s.retries, "bridge_task_id": s.bridge_task_id}
+                for s in plan.steps
+            ],
+        }
+    except ImportError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/runners/status")
+async def runner_status():
+    """Show which agent runners are available."""
+    try:
+        from runners.pool import pool
+        return pool.status()
+    except ImportError as e:
+        return {"error": str(e)}
