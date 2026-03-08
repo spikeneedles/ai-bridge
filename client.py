@@ -8,6 +8,7 @@ Usage:
   python client.py task claim <agent> [task_id]
   python client.py task done <agent> <task_id> "<result>"
   python client.py task fail <agent> <task_id> "<reason>"
+  python client.py watch [agent] [--interval N]   # live feed of new messages/tasks
   python client.py listen <channel>
   python client.py inbox <agent>
   python client.py history [channel] [--limit N]
@@ -274,6 +275,92 @@ def cmd_status(server: str):
     print(f"  Dashboard:        {server}/ui")
 
 
+def cmd_watch(server: str, args):
+    """Poll for new messages and tasks, printing them as they arrive."""
+    agent = args[0] if args else None
+    interval = 3
+    if "--interval" in args:
+        idx = args.index("--interval")
+        if idx + 1 < len(args):
+            try:
+                interval = float(args[idx + 1])
+            except ValueError:
+                pass
+
+    label = f" for {agent}" if agent else ""
+    print(f"👁  Watching AI Bridge{label} (Ctrl+C to stop, polling every {interval}s)...")
+    print(f"   Dashboard: {server}/ui")
+    print()
+
+    seen_msg_ids: set = set()
+    seen_task_ids: dict = {}  # id -> status
+
+    # Seed with existing state so we don't replay history
+    try:
+        existing_msgs = api(server, "GET", "/messages", params={"limit": 200})
+        for m in existing_msgs:
+            seen_msg_ids.add(m["id"])
+        existing_tasks = api(server, "GET", "/tasks")
+        for t in existing_tasks:
+            seen_task_ids[t["id"]] = t["status"]
+        print(f"  (seeded with {len(seen_msg_ids)} messages, {len(seen_task_ids)} tasks)\n")
+    except SystemExit:
+        pass
+
+    try:
+        while True:
+            time.sleep(interval)
+            try:
+                # Check new messages
+                msgs = api(server, "GET", "/messages", params={"limit": 100})
+                for msg in msgs:
+                    if msg["id"] not in seen_msg_ids:
+                        seen_msg_ids.add(msg["id"])
+                        ch = msg["channel"]
+                        if agent is None or ch in ("broadcast", agent, "tasks"):
+                            sender = msg["sender"]
+                            content = msg["content"]
+                            ts = time_ago(msg.get("timestamp", 0))
+                            print(f"💬 {fmt_channel(ch)} {fmt_sender(sender)} {ts}: {content}")
+
+                # Check task changes
+                tasks = api(server, "GET", "/tasks")
+                for t in tasks:
+                    tid = t["id"]
+                    status = t["status"]
+                    prev = seen_task_ids.get(tid)
+
+                    if prev is None:
+                        # New task
+                        seen_task_ids[tid] = status
+                        if agent is None or t.get("assigned_to") == agent or t.get("created_by") == agent:
+                            flag = "📋"
+                            if t.get("assigned_to") == agent:
+                                flag = "📌"
+                            print(f"{flag} NEW TASK [{tid}] \"{t['title']}\" — status: {status} | from: {t['created_by']}")
+                            if agent and t.get("assigned_to") != agent and t.get("created_by") != agent:
+                                pass  # skip unrelated
+                            elif t.get("assigned_to") is None and t.get("created_by") != agent:
+                                print(f"   → Run: python client.py task claim {agent or '<you>'}")
+
+                    elif prev != status:
+                        # Status changed
+                        seen_task_ids[tid] = status
+                        icons = {"pending": "📋", "in_progress": "⚙️ ", "done": "✅", "failed": "❌"}
+                        icon = icons.get(status, "•")
+                        print(f"{icon} TASK [{tid}] \"{t['title']}\" changed: {prev} → {status}")
+                        if status == "done" and t.get("result"):
+                            print(f"   Result: {t['result']}")
+
+            except SystemExit:
+                pass  # API errors — bridge may be restarting, keep watching
+            except Exception:
+                pass
+
+    except KeyboardInterrupt:
+        print("\nStopped watching.")
+
+
 def cmd_reset(server: str):
     api(server, "POST", "/reset")
     print("✓ Bridge reset — all messages and tasks cleared.")
@@ -323,6 +410,8 @@ def main():
         cmd_history(server, rest, limit=limit)
     elif cmd == "status":
         cmd_status(server)
+    elif cmd == "watch":
+        cmd_watch(server, rest)
     elif cmd == "reset":
         cmd_reset(server)
     else:
